@@ -1,11 +1,12 @@
 """The submission entrypoint. The platform imports this file and calls get_move."""
 
 
+import math
 import random
-import math 
+from pathlib import Path
+
 import chess
 import chess.polyglot
-from pathlib import Path
 import numpy as np
 
 DEPTH = 1
@@ -48,8 +49,10 @@ HAS_CASTLED: dict[chess.Color, tuple[tuple[chess.Square, chess.Square], ...]] = 
 
 CENTRAL_PAWNS_GUARDS: dict[chess.Color,tuple[tuple[chess.Square,chess.Square],...]] = {
 
-     chess.WHITE:((chess.E4,chess.F3),(chess.D4, chess.C3),(chess.E4,chess.D3),(chess.D4,chess.E3)),
-     chess.BLACK: ((chess.E5,chess.F6), (chess.D5,chess.C6),(chess.D5,chess.E6),(chess.E5,chess.D6)),
+     chess.WHITE: ((chess.E4, chess.F3), (chess.D4, chess.C3),
+                  (chess.E4, chess.D3), (chess.D4, chess.E3)),
+     chess.BLACK: ((chess.E5, chess.F6), (chess.D5, chess.C6),
+                  (chess.D5, chess.E6), (chess.E5, chess.D6)),
 }
 
 
@@ -58,7 +61,7 @@ KING_STARTING_SQUARE: dict[chess.Color,chess.Square]= {
     chess.BLACK: chess.E8
 }
 
-KING_CASTLING: dict[chess.Color,chess.Square]={
+KING_CASTLING: dict[chess.Color, list[chess.Square]] = {
     chess.WHITE : [chess.G1,chess.C1],
     chess.BLACK: [chess.G8,chess.C8]
 }
@@ -80,7 +83,7 @@ CENTRE_AND_ROOKS: dict[chess.Color,tuple[tuple[chess.Square,chess.Square],...]] 
     chess.BLACK: ((chess.E5,chess.E8), (chess.D5,chess.D8))
 }
 
-KNIGHT_ON_THE_RIM_IS_DIM: dict[chess.Color,tuple[chess.Square,chess.Square]] = {
+KNIGHT_ON_THE_RIM_IS_DIM: dict[chess.Color, list[chess.Square]] = {
     chess.WHITE:[chess.A3,chess.H3],
     chess.BLACK: [chess.A6,chess.H6]
 }
@@ -93,7 +96,7 @@ CENTRE_SQUARES: dict[chess.Color,list[chess.Square]] = {
 }
 
 #WILL DISINCENTIVISE MOVING BACK TO STARTING POSITIONS
-PIECES_HAVING_MOTION: dict[chess.Color,tuple[tuple[chess.PieceType,chess.Square,int],...]] = {
+PIECES_HAVING_MOTION: dict[chess.Color, tuple[tuple[chess.PieceType, chess.Square], ...]] = {
   chess.WHITE:(
        (chess.BISHOP,chess.C1),
        (chess.BISHOP, chess.F1),
@@ -155,14 +158,15 @@ def leaf_eval(board: chess.Board, mover: chess.Color) -> float:
     return NET_WEIGHT * net + (1.0 - NET_WEIGHT) * hand
 
 
-def material(board: chess.Board, side: chess.Color) -> int:
+def material(board: chess.Board, side: chess.Color) -> float:
     return sum(
         value * (len(board.pieces(piece, side)) - len(board.pieces(piece, not side)))
         for piece, value in PIECE_VALUE.items()
     )*5.0
 
 
-#THIS IS EXPENSIVE ITERATING OVER 8 PAWNS, WE ONLY REALLY CARE ABOUT THE TWO CENTRAL ONES AND MAYBE B AND G
+# THIS IS EXPENSIVE ITERATING OVER 8 PAWNS. WE ONLY REALLY CARE ABOUT THE TWO
+# CENTRAL ONES, AND MAYBE B AND G
 # def pawn_structure(board: chess.Board, color: chess.Color) -> int:
 #     return sum(
 #               board.piece_type_at(square1) == chess.PAWN and board.color_at(square1) == color
@@ -183,13 +187,18 @@ def support_central_structure(board: chess.Board, color: chess.Color)-> int:
        rooks = board.pieces(chess.ROOK,color)
 
        support = 0 
-       support += sum(pawn in pawns and knight in knights for pawn,knight in CENTRE_AND_KNIGHTS[color] )
-       support += sum(pawn in pawns and bishop in bishops for pawn,bishop in CENTRE_AND_BISHOPS[color] )
+       support += sum(pawn in pawns and knight in knights
+                      for pawn, knight in CENTRE_AND_KNIGHTS[color])
+       support += sum(pawn in pawns and bishop in bishops
+                      for pawn, bishop in CENTRE_AND_BISHOPS[color])
        support += sum(pawn in pawns and rook in rooks for pawn,rook in CENTRE_AND_ROOKS[color] )
        return support 
 
 def support_centre(board: chess.Board, color: chess.Color)-> int:
-     return CENTRE_BONUS * (support_central_structure(board, color) - support_central_structure(board, not color))
+     return CENTRE_BONUS * (
+         support_central_structure(board, color)
+         - support_central_structure(board, not color)
+     )
 
 
 def real_defenders(board: chess.Board, color: chess.Color, square: chess.Square) -> int:
@@ -216,7 +225,7 @@ def underdevloped(board: chess.Board, color: chess.Color) -> int:
     return - ( INACTIVE_PENALTY * inactive_pieces (board, color))
 
 
-def hanging_pieces(board:chess.Board,color:chess.Color) -> int:
+def hanging_pieces(board: chess.Board, color: chess.Color) -> None:
     pass
 
 def fighting_for_central_squares(board:chess.Board,color:chess.Color) -> int:
@@ -237,14 +246,16 @@ def king_away_from_centre(board: chess.Board, color: chess.Color)-> int:
         for square in KING_CASTLING[color] 
     )
 
-def score_legal_captures(board: chess.Board):
+def score_legal_captures(board: chess.Board) -> float:
    
    
-    valuable_captures = 0
+    valuable_captures = 0.0
     for m in board.generate_legal_captures():
 
-        attacker = board.piece_type_at(m.from_square)
-        victim = chess.PAWN if board.is_en_passant(m) else board.piece_type_at(m.to_square)
+        attacker = board.piece_type_at(m.from_square) or chess.PAWN
+        victim = chess.PAWN if board.is_en_passant(m) else (
+            board.piece_type_at(m.to_square) or chess.PAWN
+        )
         attacker_value = PIECE_VALUE[attacker]
         victim_value = PIECE_VALUE[victim]
 
@@ -338,7 +349,7 @@ def passed_pawns_score(board:chess.Board, color: chess.Color) -> int:
         return ((passed_pawns(board,color)) - (passed_pawns(board, not color)))
 
 
-def evaluate_board(board: chess.Board, mover: chess.Color)->int:
+def evaluate_board(board: chess.Board, mover: chess.Color) -> float:
     # with open("Log.txt","a") as f:
     #     if mover:
     #         f.writelines(f"""
@@ -360,7 +371,7 @@ def evaluate_board(board: chess.Board, mover: chess.Color)->int:
 
    
     
-    check_fee = 0
+    check_fee = 0.0
     if board.is_check():
         check_fee+=25.0
 
@@ -394,7 +405,7 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta:float, ply: int=0
     if depth == 0 or ply >= MAX_PLY:
         return  quiesce(board,alpha, beta)
 
-    best = -MATE
+    best = float(-MATE)
     moves.sort(key=lambda m: not board.is_capture(m))
     for move in moves:
         board.push(move)
@@ -409,24 +420,30 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta:float, ply: int=0
              break
     return best
 
-def quiesce(b:chess.Board, alpha, beta,qd=0):
+def quiesce(b: chess.Board, alpha: float, beta: float, qd: int = 0) -> float:
     stand_pat = leaf_eval(b, b.turn)            
-    if stand_pat >= beta: return beta
-    if stand_pat > alpha: alpha = stand_pat
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
     if qd >= 2:
          return stand_pat
     
     for m in sorted(b.generate_legal_captures(),key=lambda m: -PIECE_VALUE[
-        chess.PAWN if b.is_en_passant(m) else b.piece_type_at(m.to_square)
+        chess.PAWN if b.is_en_passant(m) else (b.piece_type_at(m.to_square) or chess.PAWN)
     ],
         ):
         # if real_defenders(b,not b.turn,m.to_square) > real_defenders(b,b.turn,m.to_square):
         # # if len(b.attackers(not b.turn, m.to_square)) > len(b.attackers(b.turn, m.to_square)):
         #     continue 
         
-        b.push(m); score = -quiesce(b, -beta, -alpha,qd+1); b.pop()
-        if score >= beta: return beta
-        if score > alpha: alpha = score
+        b.push(m)
+        score = -quiesce(b, -beta, -alpha, qd + 1)
+        b.pop()
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
     return alpha
 
 
@@ -467,7 +484,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             board.pop()
 
             
-            lookup_key = (move.from_square, board.piece_type_at(move.from_square))
+            lookup_key = (move.from_square, board.piece_type_at(move.from_square) or chess.PAWN)
             if lookup_key in LAST_MOVED:
                 score -=  25.0 * LAST_MOVED[lookup_key]
                     
@@ -479,19 +496,19 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
    
     
-    returnMove = random.choice(best)
-    board.push(returnMove)
+    chosen_move = random.choice(best)
+    board.push(chosen_move)
     
    
 
-    key = (returnMove.to_square, board.piece_type_at(returnMove.to_square))
+    key = (chosen_move.to_square, board.piece_type_at(chosen_move.to_square) or chess.PAWN)
     LAST_MOVED[key] = LAST_MOVED.get(key, 0) + 1
     SEEN[chess.polyglot.zobrist_hash(board)] = SEEN.get(chess.polyglot.zobrist_hash(board),0) + 1
 
     board.pop()
-    print(f"Played {returnMove} score: {best_score}",flush=True)
+    print(f"Played {chosen_move} score: {best_score}",flush=True)
 
-    return returnMove.uci()
+    return chosen_move.uci()
 
 
 
