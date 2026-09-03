@@ -9,7 +9,7 @@ play:
 	uv run python -m harness.play --white . --black baselines/greedy
 
 arena:
-	uv run python -m harness.arena --opponent baselines/greedy --games 20
+	uv run python -m harness.arena --opponent baselines/minimax --games 20
 
 zip:
 	uv run python -m harness.package

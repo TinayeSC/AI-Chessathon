@@ -4,3 +4,8 @@ __pycache__/
 .ruff_cache/
 submission.zip
 *.pgn
+Lichess_Games/
+Log.txt
+*.zst
+*.jsonl
+*.csv
