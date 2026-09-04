@@ -9,7 +9,7 @@ import chess
 import chess.polyglot
 import numpy as np
 
-DEPTH = 2
+# DEPTH = 2
 BOOK_PATH = Path(__file__).parent / "weights" / "elite.bin"
 BOOK = chess.polyglot.open_reader(BOOK_PATH) if BOOK_PATH.exists() else None
 
@@ -137,6 +137,7 @@ if "cp_scale" in _w.files:
 
 
 def encode(board: chess.Board) -> np.ndarray:
+    """Reference encoder. Only used to seed and to verify the accumulator."""
     x = np.zeros(768, dtype=np.float32)
     flip = board.turn == chess.BLACK
     for sq, piece in board.piece_map().items():
@@ -146,8 +147,87 @@ def encode(board: chess.Board) -> np.ndarray:
     return x
 
 
+_PLANE = {t: i for i, t in enumerate(PIECE_ORDER)}
+
+
+def _index(piece_type: chess.PieceType, colour: chess.Color, square: chess.Square,
+           perspective: chess.Color) -> int:
+    """Where this piece lands in the 768-vector, seen from `perspective`."""
+    sq = square if perspective == chess.WHITE else chess.square_mirror(square)
+    plane = _PLANE[piece_type] + (0 if colour == perspective else 6)
+    return plane * 64 + sq
+
+
+class Accumulator:
+    """First-layer output, kept up to date instead of recomputed.
+
+    encode() costs 12.5us and was 22.6% of total search time, because it rebuilds a
+    768-vector from scratch at every leaf. A move changes at most a handful of those
+    entries, so adding and subtracting the affected columns of W0 is far cheaper.
+
+    Two vectors are needed, not one: encode() is side-to-move relative, so the whole
+    encoding flips when the turn changes. We keep one accumulator per perspective and
+    read whichever matches board.turn.
+    """
+
+    __slots__ = ("_stack", "black", "white")
+
+    def __init__(self, board: chess.Board) -> None:
+        self.white = b0.copy()
+        self.black = b0.copy()
+        for square, piece in board.piece_map().items():
+            self.white += W0[_index(piece.piece_type, piece.color, square, chess.WHITE)]
+            self.black += W0[_index(piece.piece_type, piece.color, square, chess.BLACK)]
+        self._stack: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def _apply(self, piece_type: chess.PieceType, colour: chess.Color,
+               square: chess.Square, sign: float) -> None:
+        self.white += sign * W0[_index(piece_type, colour, square, chess.WHITE)]
+        self.black += sign * W0[_index(piece_type, colour, square, chess.BLACK)]
+
+    def push(self, board: chess.Board, move: chess.Move) -> None:
+        """Call BEFORE board.push(move). Snapshots so pop() cannot drift."""
+        self._stack.append((self.white.copy(), self.black.copy()))
+        mover = board.piece_at(move.from_square)
+        if mover is None:                       # null move: nothing on the board changes
+            return
+        colour = mover.color
+        self._apply(mover.piece_type, colour, move.from_square, -1.0)
+
+        if board.is_en_passant(move):
+            captured_square = move.to_square + (-8 if colour == chess.WHITE else 8)
+            self._apply(chess.PAWN, not colour, captured_square, -1.0)
+        else:
+            victim = board.piece_at(move.to_square)
+            if victim is not None:
+                self._apply(victim.piece_type, victim.color, move.to_square, -1.0)
+
+        self._apply(move.promotion or mover.piece_type, colour, move.to_square, 1.0)
+
+        if board.is_castling(move):
+            rank = 0 if colour == chess.WHITE else 7
+            kingside = chess.square_file(move.to_square) == 6
+            rook_from = chess.square(7 if kingside else 0, rank)
+            rook_to = chess.square(5 if kingside else 3, rank)
+            self._apply(chess.ROOK, colour, rook_from, -1.0)
+            self._apply(chess.ROOK, colour, rook_to, 1.0)
+
+    def pop(self) -> None:
+        self.white, self.black = self._stack.pop()
+
+    def value(self, turn: chess.Color) -> np.ndarray:
+        vector: np.ndarray = self.white if turn == chess.WHITE else self.black
+        return vector
+
+
+ACC: Accumulator | None = None
+
+
 def nnue_eval(board: chess.Board) -> float:
-    h = np.maximum(encode(board) @ W0 + b0, 0)
+    if ACC is not None:
+        h = np.maximum(ACC.value(board.turn), 0)
+    else:
+        h = np.maximum(encode(board) @ W0 + b0, 0)
     h = np.maximum(h @ W1 + b1, 0)
     return float(np.tanh(h @ W2 + b2)[0]) * CP_SCALE
 
@@ -233,9 +313,14 @@ def hanging_pieces(board: chess.Board, color: chess.Color) -> None:
     pass
 
 def fighting_for_central_squares(board:chess.Board,color:chess.Color) -> int:
-    return sum(real_defenders(board,color,sq)
-               for sq in CENTRE_SQUARES[color]) - sum(real_defenders(board,not color,sq)
-                                                      for sq in CENTRE_SQUARES[not color])
+    # Was real_defenders(), which calls is_pinned() per attacker: 10.1us/leaf, the
+    # most expensive term in the eval. A pinned piece still contributes to control
+    # of a square, so the pin check buys accuracy we do not need here. It stays in
+    # the capture logic, where a phantom defender loses a piece.
+    return sum(chess.popcount(board.attackers_mask(color, sq))
+               for sq in CENTRE_SQUARES[color]) - sum(
+               chess.popcount(board.attackers_mask(not color, sq))
+               for sq in CENTRE_SQUARES[not color])
 
 def bishop_pair(board: chess.Board, color: chess.Color) -> int:
     mine = len(board.pieces(chess.BISHOP, color)) >= 2
@@ -391,7 +476,9 @@ def evaluate_board(board: chess.Board, mover: chess.Color) -> float:
     # king_safety(board,mover)+
     dim_knight(board,mover)+
     king_away_from_centre(board,mover)+
-    king_attack(board,mover)+
+    # king_attack(board,mover)+   # 5.9us/leaf and KING_ATTACK_BONUS is 0 -> always 0.
+    #                               Measured worse in games at 5 and 15 (98.3% at 0).
+    #                               Uncomment together with a non-zero bonus.
     check_fee+
     passed_pawns_score(board,mover)+
     king_shelter(board,mover)
@@ -403,7 +490,30 @@ def evaluate_board(board: chess.Board, mover: chess.Color) -> float:
    
 MAX_PLY = 24            # absolute ceiling across negamax AND quiesce combined
 MAX_QUIESCE = 4         # extra plies quiesce may add once negamax stops
-MAX_DEPTH = 8           # iterative deepening never asks for more than this
+MAX_DEPTH = 16          # ceiling only; the clock stops us long before this in
+                        # middlegames, but endgames were hitting 8 and stopping.
+
+
+# Two "killer" moves per ply: quiet moves that caused a beta cutoff at this depth
+# elsewhere in the tree. They tend to work again in sibling positions, and trying
+# them early is what makes the cutoff fire on move 1 instead of move 20.
+KILLERS: list[list[chess.Move | None]] = [[None, None] for _ in range(64)]
+
+
+def order_key(board: chess.Board, move: chess.Move, ply: int) -> int:
+    """Lower sorts first. Captures by MVV-LVA, then killers, then the rest."""
+    if board.is_capture(move):
+        victim = chess.PAWN if board.is_en_passant(move) else (
+            board.piece_type_at(move.to_square) or chess.PAWN)
+        attacker = board.piece_type_at(move.from_square) or chess.PAWN
+        # PIECE_VALUE has no KING entry, and a king can be the attacker.
+        victim_value = int(PIECE_VALUE.get(victim, 0))
+        attacker_value = int(PIECE_VALUE.get(attacker, 10_000))
+        # most valuable victim first; among equal victims, cheapest attacker first
+        return -(victim_value * 16 - attacker_value)
+    if ply < len(KILLERS) and move in KILLERS[ply]:
+        return 1_000_000
+    return 2_000_000
 
 
 class TimeUp(Exception):
@@ -430,19 +540,50 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta:float, ply: int=0
     if depth <= 0 or ply >= MAX_PLY:
         return quiesce(board, alpha, beta, ply)
 
+    # Null-move pruning: let the opponent move twice. If we are STILL above beta
+    # after handing over a free tempo, a real move is at least as good, so cut off
+    # without searching any. Guards: never out of check (passing is illegal there),
+    # never at shallow depth, and never with only pawns left - that is where
+    # zugzwang lives and "I am fine after passing" becomes a lie.
+    if (
+        depth >= 3
+        and not board.is_check()
+        and beta < MATE - MAX_PLY
+        and board.occupied_co[board.turn] & ~board.pawns & ~board.kings
+    ):
+        if ACC is not None:
+            ACC.push(board, chess.Move.null())
+        board.push(chess.Move.null())
+        null = -negamax(board, depth - 3, -beta, -beta + 1.0, ply + 1)
+        board.pop()
+        if ACC is not None:
+            ACC.pop()
+        if null >= beta:
+            return beta
+
     best = float(-MATE)
-    moves.sort(key=lambda m: not board.is_capture(m))
+    moves.sort(key=lambda m: order_key(board, m, ply))
     for move in moves:
+        if ACC is not None:
+            ACC.push(board, move)
         board.push(move)
         extra = 1 if board.is_check() else 0
         score = -negamax(board, depth - 1 + extra, -beta, -alpha, ply + 1)
         board.pop()
+        if ACC is not None:
+            ACC.pop()
         if score > best:
-            best = score 
+            best = score
         if best > alpha:
-             alpha = best
+            alpha = best
         if alpha >= beta:
-             break
+            # A quiet move good enough to cut off here will often cut off in a
+            # sibling position too. Remember it, newest first.
+            quiet = not board.is_capture(move)
+            if quiet and ply < len(KILLERS) and KILLERS[ply][0] != move:
+                KILLERS[ply][1] = KILLERS[ply][0]
+                KILLERS[ply][0] = move
+            break
     return best
 
 def quiesce(b: chess.Board, alpha: float, beta: float, ply: int = 0, qd: int = 0) -> float:
@@ -463,9 +604,13 @@ def quiesce(b: chess.Board, alpha: float, beta: float, ply: int = 0, qd: int = 0
         # # if len(b.attackers(not b.turn, m.to_square)) > len(b.attackers(b.turn, m.to_square)):
         #     continue 
         
+        if ACC is not None:
+            ACC.push(b, m)
         b.push(m)
         score = -quiesce(b, -beta, -alpha, ply + 1, qd + 1)
         b.pop()
+        if ACC is not None:
+            ACC.pop()
         if score >= beta:
             return beta
         if score > alpha:
@@ -477,14 +622,32 @@ SEEN: dict[int,int] = {}
 LAST_MOVED:dict[tuple[chess.Square,chess.PieceType],int] = {}
 
 
-def search_root(board: chess.Board, depth: int) -> tuple[chess.Move | None, float]:
-    """One full-width pass at `depth`. Raises TimeUp if the budget runs out mid-pass."""
+def search_root(
+    board: chess.Board, depth: int, first: chess.Move | None = None
+) -> tuple[chess.Move | None, float]:
+    """One full-width pass at `depth`. Raises TimeUp if the budget runs out mid-pass.
+
+    `first` is the best move from the previous, shallower iteration. Searching it
+    first sets a strong alpha immediately, so every later move is more likely to
+    fail low and cut off early. All iterations analyse the same root position, so
+    the hint stays valid for the whole of this get_move call.
+    """
     best_move: chess.Move | None = None
     best_score = -math.inf
-    for move in board.legal_moves:
+
+    moves = list(board.legal_moves)
+    if first is not None and first in moves:
+        moves.remove(first)
+        moves.insert(0, first)
+
+    for move in moves:
+        if ACC is not None:
+            ACC.push(board, move)
         board.push(move)
         if board.is_checkmate():
             board.pop()
+            if ACC is not None:
+                ACC.pop()
             return move, float(MATE)
         extra = 1 if board.is_check() else 0
         after = chess.polyglot.zobrist_hash(board)
@@ -494,6 +657,8 @@ def search_root(board: chess.Board, depth: int) -> tuple[chess.Move | None, floa
             # pop before TimeUp unwinds, or the board is left corrupted for the
             # next iteration and every later move is generated from a wrong position.
             board.pop()
+            if ACC is not None:
+                ACC.pop()
 
         seen = SEEN.get(after, 0)
         if seen >= 1:
@@ -526,24 +691,30 @@ def get_move(fen: str, time_left_ms: int) -> str:
     # A fraction converges: the clock settles where budget == increment.
     DEADLINE = time.monotonic() + max(time_left_ms / 25.0, 15.0) / 1000.0
     NODES = 0
+    global ACC
+    ACC = Accumulator(board)
 
     # Always hold a legal move, so a timeout at depth 1 still returns something.
     chosen_move = next(iter(board.legal_moves))
     best_score = -math.inf
     reached = 0
+    hint: chess.Move | None = None
 
     for depth in range(1, MAX_DEPTH + 1):
         try:
-            move, score = search_root(board, depth)
+            move, score = search_root(board, depth, hint)
         except TimeUp:
             # negamax and quiesce push without try/finally (too costly in the hot
             # loop), so an unwind leaves their pushes on the board. Rebuild rather
             # than trying to unwind them: pushing onto a corrupted board is a crash.
+            # The accumulator drifts the same way, so rebuild it too.
             board = chess.Board(fen)
+            ACC = Accumulator(board)
             break
         if move is None:
             break
         chosen_move, best_score, reached = move, score, depth
+        hint = move                              # feed this depth's answer to the next
         if abs(score) >= MATE - MAX_PLY:
             break                                   # forced mate found, no point deeper
 
