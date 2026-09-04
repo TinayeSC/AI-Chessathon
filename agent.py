@@ -515,9 +515,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
         except IndexError:
             pass
 
-    # Spend a slice of what is left plus most of the increment we are about to earn.
-    # Never a fixed number: that is what flags you in long games.
-    DEADLINE = time.monotonic() + (time_left_ms / 30.0 + 300.0) / 1000.0
+    # A pure fraction of what is left, never a fixed additive constant. Adding a
+    # constant larger than the increment loses ground every move and eventually
+    # flags - which is exactly what a fixed +300ms did at make gate's 5s + 0.1s.
+    # A fraction converges: the clock settles where budget == increment.
+    DEADLINE = time.monotonic() + max(time_left_ms / 25.0, 15.0) / 1000.0
     NODES = 0
 
     # Always hold a legal move, so a timeout at depth 1 still returns something.
