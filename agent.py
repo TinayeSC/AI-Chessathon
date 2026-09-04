@@ -2,14 +2,14 @@
 
 
 import math
-import random
+import time
 from pathlib import Path
 
 import chess
 import chess.polyglot
 import numpy as np
 
-DEPTH = 1
+DEPTH = 2
 BOOK_PATH = Path(__file__).parent / "weights" / "gm2001.bin"
 BOOK = chess.polyglot.open_reader(BOOK_PATH) if BOOK_PATH.exists() else None
 
@@ -30,7 +30,7 @@ INACTIVE_PENALTY = 10
 FIANCHETTO_BONUS = 3
 DIM_RIM_PENALTY = 3
 OPPONENT_KING_BONUS = 20
-KING_ATTACK_BONUS = 5
+KING_ATTACK_BONUS = 0
 # Import time runs once per game, inside a 60 second budget, before your clock starts.
 # Load weights and build tables out here, not inside get_move.
 
@@ -113,8 +113,8 @@ PIECES_HAVING_MOTION: dict[chess.Color, tuple[tuple[chess.PieceType, chess.Squar
        (chess.BISHOP, chess.F8),
        (chess.KNIGHT,chess.B8),
        (chess.KNIGHT,chess.G8),
-       (chess.PAWN,chess.E2),
-        (chess.PAWN,chess.D2)),
+       (chess.PAWN,chess.E7),
+        (chess.PAWN,chess.D7)),
     #    (chess.QUEEN,chess.D8),
     #    (chess.ROOK,chess.A8),
     #    (chess.ROOK,chess.H8)),
@@ -147,7 +147,7 @@ def nnue_eval(board: chess.Board) -> float:
     h = np.maximum(h @ W1 + b1, 0)
     return float(np.tanh(h @ W2 + b2)[0]) * CP_SCALE
 
-NET_WEIGHT = 0.0      # 0.0 = hand only, 1.0 = net only
+NET_WEIGHT = 0.2      # 0.0 = hand only, 1.0 = net only
 FAST_EVAL = False
 
 def leaf_eval(board: chess.Board, mover: chess.Color) -> float:
@@ -397,13 +397,34 @@ def evaluate_board(board: chess.Board, mover: chess.Color) -> float:
    )
 
    
-MAX_PLY = 5
+MAX_PLY = 24            # absolute ceiling across negamax AND quiesce combined
+MAX_QUIESCE = 4         # extra plies quiesce may add once negamax stops
+MAX_DEPTH = 8           # iterative deepening never asks for more than this
+
+
+class TimeUp(Exception):
+    """Raised deep in the search when the move budget is spent."""
+
+
+NODES = 0
+DEADLINE = 0.0
+
+
+def check_clock() -> None:
+    """Cheap clock check. time.monotonic() every node would cost more than it saves."""
+    global NODES
+    NODES += 1
+    if NODES % 1024 == 0 and time.monotonic() > DEADLINE:
+        raise TimeUp
+
+
 def negamax(board: chess.Board, depth: int, alpha: float, beta:float, ply: int=0) -> float:
+    check_clock()
     moves = list(board.legal_moves)
     if not moves:
         return -(MATE - ply) if board.is_check() else 0.0
-    if depth == 0 or ply >= MAX_PLY:
-        return  quiesce(board,alpha, beta)
+    if depth <= 0 or ply >= MAX_PLY:
+        return quiesce(board, alpha, beta, ply)
 
     best = float(-MATE)
     moves.sort(key=lambda m: not board.is_capture(m))
@@ -420,14 +441,15 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta:float, ply: int=0
              break
     return best
 
-def quiesce(b: chess.Board, alpha: float, beta: float, qd: int = 0) -> float:
-    stand_pat = leaf_eval(b, b.turn)            
+def quiesce(b: chess.Board, alpha: float, beta: float, ply: int = 0, qd: int = 0) -> float:
+    check_clock()
+    stand_pat = leaf_eval(b, b.turn)
     if stand_pat >= beta:
         return beta
     if stand_pat > alpha:
         alpha = stand_pat
-    if qd >= 2:
-         return stand_pat
+    if qd >= MAX_QUIESCE or ply >= MAX_PLY:
+        return stand_pat
     
     for m in sorted(b.generate_legal_captures(),key=lambda m: -PIECE_VALUE[
         chess.PAWN if b.is_en_passant(m) else (b.piece_type_at(m.to_square) or chess.PAWN)
@@ -438,7 +460,7 @@ def quiesce(b: chess.Board, alpha: float, beta: float, qd: int = 0) -> float:
         #     continue 
         
         b.push(m)
-        score = -quiesce(b, -beta, -alpha, qd + 1)
+        score = -quiesce(b, -beta, -alpha, ply + 1, qd + 1)
         b.pop()
         if score >= beta:
             return beta
@@ -449,65 +471,83 @@ def quiesce(b: chess.Board, alpha: float, beta: float, qd: int = 0) -> float:
 
 SEEN: dict[int,int] = {}
 LAST_MOVED:dict[tuple[chess.Square,chess.PieceType],int] = {}
-def get_move(fen: str, time_left_ms: int) -> str:
-    board = chess.Board(fen)
-    
-   
-    best_score = -math.inf
-    best: list[chess.Move] = []
 
+
+def search_root(board: chess.Board, depth: int) -> tuple[chess.Move | None, float]:
+    """One full-width pass at `depth`. Raises TimeUp if the budget runs out mid-pass."""
+    best_move: chess.Move | None = None
+    best_score = -math.inf
+    for move in board.legal_moves:
+        board.push(move)
+        if board.is_checkmate():
+            board.pop()
+            return move, float(MATE)
+        extra = 1 if board.is_check() else 0
+        after = chess.polyglot.zobrist_hash(board)
+        try:
+            score = -negamax(board, depth - 1 + extra, -math.inf, -best_score, 1)
+        finally:
+            # pop before TimeUp unwinds, or the board is left corrupted for the
+            # next iteration and every later move is generated from a wrong position.
+            board.pop()
+
+        seen = SEEN.get(after, 0)
+        if seen >= 1:
+            score = 50.0 - (25 * seen)
+
+        lookup_key = (move.from_square, board.piece_type_at(move.from_square) or chess.PAWN)
+        if lookup_key in LAST_MOVED:
+            score -= 25.0 * LAST_MOVED[lookup_key]
+
+        if score > best_score:
+            best_move = move
+            best_score = score
+    return best_move, best_score
+
+
+def get_move(fen: str, time_left_ms: int) -> str:
+    global DEADLINE, NODES
+    board = chess.Board(fen)
 
     if BOOK is not None:
         try:
-            print(f"Book Move: {BOOK.weighted_choice(board).move}")
             return BOOK.weighted_choice(board).move.uci()
         except IndexError:
             pass
-   
-    
-    # print(f"SEEN MOVES: {SEEN}\n",flush=True)
-    for move in board.legal_moves:
-           
-                
-            board.push(move)
-            if board.is_checkmate():
-                return move.uci()
-            extra = 1 if board.is_check() else 0
-            score = -negamax(board,DEPTH+extra, -math.inf,-best_score,1)
 
-    
-            if SEEN.get(chess.polyglot.zobrist_hash(board),0) >= 1:
-                score = 50.0 - (25* SEEN.get(chess.polyglot.zobrist_hash(board),0))
+    # Spend a slice of what is left plus most of the increment we are about to earn.
+    # Never a fixed number: that is what flags you in long games.
+    DEADLINE = time.monotonic() + (time_left_ms / 30.0 + 300.0) / 1000.0
+    NODES = 0
 
-           
+    # Always hold a legal move, so a timeout at depth 1 still returns something.
+    chosen_move = next(iter(board.legal_moves))
+    best_score = -math.inf
+    reached = 0
 
-            board.pop()
+    for depth in range(1, MAX_DEPTH + 1):
+        try:
+            move, score = search_root(board, depth)
+        except TimeUp:
+            # negamax and quiesce push without try/finally (too costly in the hot
+            # loop), so an unwind leaves their pushes on the board. Rebuild rather
+            # than trying to unwind them: pushing onto a corrupted board is a crash.
+            board = chess.Board(fen)
+            break
+        if move is None:
+            break
+        chosen_move, best_score, reached = move, score, depth
+        if abs(score) >= MATE - MAX_PLY:
+            break                                   # forced mate found, no point deeper
 
-            
-            lookup_key = (move.from_square, board.piece_type_at(move.from_square) or chess.PAWN)
-            if lookup_key in LAST_MOVED:
-                score -=  25.0 * LAST_MOVED[lookup_key]
-                    
-
-            if score > best_score:
-                best = [move]
-                best_score = score
-           
-
-   
-    
-    chosen_move = random.choice(best)
     board.push(chosen_move)
-    
-   
-
     key = (chosen_move.to_square, board.piece_type_at(chosen_move.to_square) or chess.PAWN)
     LAST_MOVED[key] = LAST_MOVED.get(key, 0) + 1
-    SEEN[chess.polyglot.zobrist_hash(board)] = SEEN.get(chess.polyglot.zobrist_hash(board),0) + 1
-
+    digest = chess.polyglot.zobrist_hash(board)
+    SEEN[digest] = SEEN.get(digest, 0) + 1
     board.pop()
-    print(f"Played {chosen_move} score: {best_score}",flush=True)
 
+    print(f"Played {chosen_move} depth {reached} score {best_score:.1f} nodes {NODES}", flush=True)
     return chosen_move.uci()
 
 
