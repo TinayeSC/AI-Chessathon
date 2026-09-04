@@ -21,10 +21,12 @@ import torch
 HIDDEN_1 = 256          # first hidden layer width. Bigger = smarter but slower at runtime.
 HIDDEN_2 = 32
 BATCH_SIZE = 1024       # positions per gradient step.
-EPOCHS = 30             # full passes over the data.
+EPOCHS = 40             # upper bound; early stopping usually ends it sooner.
+PATIENCE = 4            # stop after this many epochs with no validation improvement.
 LEARNING_RATE = 1e-3
 VAL_FRACTION = 0.1      # held out to check we are learning, not memorising.
-CP_SCALE = 400.0        # centipawns that map to ~0.76 after tanh. Standard-ish choice.
+CP_SCALE = 600.0        # larger than 400 so +/-900cp does not saturate tanh: at 400 a
+                        # knight-down and a rook-down both trained toward -1.
 MAX_PIECES = 32         # most pieces on a board; the index array is padded to this.
 PAD = 768               # sentinel index meaning "no piece"; dropped by expand().
 OUT_PATH = Path(__file__).resolve().parent.parent / "weights" / "eval_net.npz"
@@ -136,6 +138,7 @@ def export(net: torch.nn.Sequential) -> None:
         arrays[f"W{index}"] = layer.weight.detach().numpy().T.copy()
         arrays[f"b{index}"] = layer.bias.detach().numpy()
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    arrays["cp_scale"] = np.array([CP_SCALE], dtype=np.float32)
     np.savez(OUT_PATH, **arrays)
     print(f"saved {OUT_PATH} ({OUT_PATH.stat().st_size:,} bytes)")
     for name, array in arrays.items():
@@ -169,6 +172,10 @@ def main() -> None:
         y = torch.from_numpy(y_slice).unsqueeze(1)   # (B,) -> (B,1) to match output
         return torch.nn.functional.mse_loss(net(x), y)
 
+    best_val = float("inf")
+    best_state: dict[str, torch.Tensor] = {}
+    stale = 0
+
     for epoch in range(EPOCHS):
         net.train()
         # Reshuffle each epoch so mini-batches differ between passes.
@@ -191,9 +198,24 @@ def main() -> None:
                 chunk = val_idx[start:stop]
                 val_total += batch_loss(chunk, val_y[start:stop]).item() * len(chunk)
             val_loss = val_total / len(val_idx)
-        # If train loss falls while validation rises, it is memorising - stop early.
-        print(f"  epoch {epoch:3}  train {running / len(train_idx):.5f}  val {val_loss:.5f}")
+        marker = ""
+        if val_loss < best_val - 1e-5:
+            best_val, stale = val_loss, 0
+            best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+            marker = "  <- best"
+        else:
+            stale += 1
+        print(f"  epoch {epoch:3}  train {running / len(train_idx):.5f}  "
+              f"val {val_loss:.5f}{marker}")
+        if stale >= PATIENCE:
+            print(f"  no improvement for {PATIENCE} epochs, stopping")
+            break
 
+    # Restore the best epoch. Saving the last one ships a net that has been
+    # memorising for however many epochs since validation bottomed out.
+    if best_state:
+        net.load_state_dict(best_state)
+        print(f"  restored best epoch (val {best_val:.5f})")
     export(net)
 
     # Sanity check the sign convention. A side that is a queen up must score positive.
