@@ -4,14 +4,13 @@
 import math
 import time
 from pathlib import Path
-from typing import Any
 
 import chess
 import chess.polyglot
 import numpy as np
 
 # DEPTH = 2
-BOOK_PATH = Path(__file__).parent / "weights" / "elite.bin"
+BOOK_PATH = Path(__file__).resolve().parents[4] / "weights" / "elite.bin"
 BOOK = chess.polyglot.open_reader(BOOK_PATH) if BOOK_PATH.exists() else None
 
 ### TRY WORKING ON DYNAMIC PIECE VALUE. PIECE VALUE STARTS AT STANDARD VALUES, BUT AS THE GAME
@@ -129,7 +128,7 @@ MATE = 10**6
 CP_SCALE = 400.0
 PIECE_ORDER = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
 
-_w = np.load(Path(__file__).parent / "weights" / "eval_net.npz")
+_w = np.load(Path(__file__).resolve().parents[4] / "weights" / "eval_net.npz")
 W0, b0, W1, b1, W2, b2 = _w["W0"], _w["b0"], _w["W1"], _w["b1"], _w["W2"], _w["b2"]
 # Read the training scale from the file itself. Keeping it as a separate constant
 # here means a retrain at a different scale silently mis-scales every evaluation.
@@ -232,7 +231,7 @@ def nnue_eval(board: chess.Board) -> float:
     h = np.maximum(h @ W1 + b1, 0)
     return float(np.tanh(h @ W2 + b2)[0]) * CP_SCALE
 
-NET_WEIGHT = 0.2      # 0.0 = hand only, 1.0 = net only
+NET_WEIGHT = 1.0      # 0.0 = hand only, 1.0 = net only
 FAST_EVAL = False
 
 def leaf_eval(board: chess.Board, mover: chess.Color) -> float:
@@ -248,14 +247,11 @@ def leaf_eval(board: chess.Board, mover: chess.Color) -> float:
     return NET_WEIGHT * net + (1.0 - NET_WEIGHT) * hand
 
 
-MATERIAL_WEIGHT = 5.0     # one constant, so the JIT kernel and this cannot drift apart
-
-
 def material(board: chess.Board, side: chess.Color) -> float:
     return sum(
         value * (len(board.pieces(piece, side)) - len(board.pieces(piece, not side)))
         for piece, value in PIECE_VALUE.items()
-    ) * MATERIAL_WEIGHT
+    )*5.0
 
 
 # THIS IS EXPENSIVE ITERATING OVER 8 PAWNS. WE ONLY REALLY CARE ABOUT THE TWO
@@ -294,6 +290,9 @@ def support_centre(board: chess.Board, color: chess.Color)-> int:
      )
 
 
+def real_defenders(board: chess.Board, color: chess.Color, square: chess.Square) -> int:
+    return sum(1 for sq in board.attackers(color, square)
+               if not board.is_pinned(color, sq))
 
      
 
@@ -315,6 +314,8 @@ def underdevloped(board: chess.Board, color: chess.Color) -> int:
     return - ( INACTIVE_PENALTY * inactive_pieces (board, color))
 
 
+def hanging_pieces(board: chess.Board, color: chess.Color) -> None:
+    pass
 
 def fighting_for_central_squares(board:chess.Board,color:chess.Color) -> int:
     # Was real_defenders(), which calls is_pinned() per attacker: 10.1us/leaf, the
@@ -326,6 +327,10 @@ def fighting_for_central_squares(board:chess.Board,color:chess.Color) -> int:
                chess.popcount(board.attackers_mask(not color, sq))
                for sq in CENTRE_SQUARES[not color])
 
+def bishop_pair(board: chess.Board, color: chess.Color) -> int:
+    mine = len(board.pieces(chess.BISHOP, color)) >= 2
+    theirs = len(board.pieces(chess.BISHOP, not color)) >= 2
+    return BISHOP_PAIR_BONUS * (mine - theirs)
 
 
   
@@ -335,9 +340,51 @@ def king_away_from_centre(board: chess.Board, color: chess.Color)-> int:
         for square in KING_CASTLING[color] 
     )
 
+def score_legal_captures(board: chess.Board) -> float:
+   
+   
+    valuable_captures = 0.0
+    for m in board.generate_legal_captures():
+
+        attacker = board.piece_type_at(m.from_square) or chess.PAWN
+        victim = chess.PAWN if board.is_en_passant(m) else (
+            board.piece_type_at(m.to_square) or chess.PAWN
+        )
+        attacker_value = PIECE_VALUE[attacker]
+        victim_value = PIECE_VALUE[victim]
+
+        opponent_defenders =  real_defenders(board,not board.turn,m.to_square)
+
+        if attacker_value > victim_value and opponent_defenders > 0:
+            valuable_captures -=  0.1*(attacker_value - victim_value)
+
+        elif attacker_value <victim_value:
+                    valuable_captures +=  0.1*(victim_value-attacker_value)
+
+        elif opponent_defenders < real_defenders(board,board.turn,m.to_square)-1:
+            valuable_captures += 2
+
+        else:
+            valuable_captures += 1
+
+    return valuable_captures
 
 
+def king_zone_pressure(board: chess.Board, color: chess.Color) -> int:
+    """Count how many times color attacks the squares around the enemy king."""
+    enemy_king = board.king(not color)
+    if enemy_king is None:
+        return 0
+    return sum(
+        chess.popcount(board.attackers_mask(color, square))
+        for square in board.attacks(enemy_king)
+    )
 
+
+def king_attack(board: chess.Board, color: chess.Color) -> int:
+    return KING_ATTACK_BONUS * (
+        king_zone_pressure(board, color) - king_zone_pressure(board, not color)
+    )  
 
 SHIELD_MASK: dict[chess.Color, list[int]] = {chess.WHITE: [], chess.BLACK: []}
 for side in (chess.WHITE, chess.BLACK):
@@ -355,8 +402,6 @@ for side in (chess.WHITE, chess.BLACK):
 
 
 SHIELD_BONUS = 12
-
-
 def pawn_phalanx(board: chess.Board, color: chess.Color) -> int:
     king_square = board.king(color)
     if king_square is None:
@@ -398,250 +443,54 @@ def passed_pawns_score(board:chess.Board, color: chess.Color) -> int:
         return ((passed_pawns(board,color)) - (passed_pawns(board, not color)))
 
 
-# ---------------------------------------------------------------------------
-# Piece-square tables and rook placement.
-#
-# The eval was flat across quiet moves: in round 4 it scored ten consecutive
-# moves between -83 and -105, so it shuffled a knight to h2 and a bishop to g1
-# while the opponent built a mating net. A table per (piece, square) is the
-# cheapest term that gives every quiet move a different score.
-#
-# Values are centipawns from White's point of view, a8 first (matching how the
-# rows read on screen). PST_B is the same tables pre-mirrored, so neither colour
-# pays for a square_mirror() at runtime.
-# ---------------------------------------------------------------------------
-
-_PST_WHITE_SOURCE: dict[chess.PieceType, tuple[int, ...]] = {
-    chess.PAWN: (
-         0,  0,  0,  0,  0,  0,  0,  0,
-        50, 50, 50, 50, 50, 50, 50, 50,
-        10, 10, 20, 30, 30, 20, 10, 10,
-         5,  5, 10, 25, 25, 10,  5,  5,
-         0,  0,  0, 20, 20,  0,  0,  0,
-         5, -5,-10,  0,  0,-10, -5,  5,
-         5, 10, 10,-20,-20, 10, 10,  5,
-         0,  0,  0,  0,  0,  0,  0,  0,
-    ),
-    chess.KNIGHT: (
-       -50,-40,-30,-30,-30,-30,-40,-50,
-       -40,-20,  0,  0,  0,  0,-20,-40,
-       -30,  0, 10, 15, 15, 10,  0,-30,
-       -30,  5, 15, 20, 20, 15,  5,-30,
-       -30,  0, 15, 20, 20, 15,  0,-30,
-       -30,  5, 10, 15, 15, 10,  5,-30,
-       -40,-20,  0,  5,  5,  0,-20,-40,
-       -50,-40,-30,-30,-30,-30,-40,-50,
-    ),
-    chess.BISHOP: (
-       -20,-10,-10,-10,-10,-10,-10,-20,
-       -10,  0,  0,  0,  0,  0,  0,-10,
-       -10,  0,  5, 10, 10,  5,  0,-10,
-       -10,  5,  5, 10, 10,  5,  5,-10,
-       -10,  0, 10, 10, 10, 10,  0,-10,
-       -10, 10, 10, 10, 10, 10, 10,-10,
-       -10,  5,  0,  0,  0,  0,  5,-10,
-       -20,-10,-10,-10,-10,-10,-10,-20,
-    ),
-    chess.ROOK: (
-         0,  0,  0,  0,  0,  0,  0,  0,
-         5, 10, 10, 10, 10, 10, 10,  5,
-        -5,  0,  0,  0,  0,  0,  0, -5,
-        -5,  0,  0,  0,  0,  0,  0, -5,
-        -5,  0,  0,  0,  0,  0,  0, -5,
-        -5,  0,  0,  0,  0,  0,  0, -5,
-        -5,  0,  0,  0,  0,  0,  0, -5,
-         0,  0,  0,  5,  5,  0,  0,  0,
-    ),
-    chess.QUEEN: (
-       -20,-10,-10, -5, -5,-10,-10,-20,
-       -10,  0,  0,  0,  0,  0,  0,-10,
-       -10,  0,  5,  5,  5,  5,  0,-10,
-        -5,  0,  5,  5,  5,  5,  0, -5,
-         0,  0,  5,  5,  5,  5,  0, -5,
-       -10,  5,  5,  5,  5,  5,  0,-10,
-       -10,  0,  5,  0,  0,  0,  0,-10,
-       -20,-10,-10, -5, -5,-10,-10,-20,
-    ),
-    chess.KING: (
-       -30,-40,-40,-50,-50,-40,-40,-30,
-       -30,-40,-40,-50,-50,-40,-40,-30,
-       -30,-40,-40,-50,-50,-40,-40,-30,
-       -30,-40,-40,-50,-50,-40,-40,-30,
-       -20,-30,-30,-40,-40,-30,-30,-20,
-       -10,-20,-20,-20,-20,-20,-20,-10,
-        20, 20,  0,  0,  0, 20, 20, 20,
-        20, 30, 10,  0,  0, 10, 30, 20,
-    ),
-}
-
-# Source rows read a8-first; chess.SQUARES is a1-first. Flip once, at import.
-PST_W: dict[chess.PieceType, tuple[int, ...]] = {
-    piece: tuple(rows[(7 - chess.square_rank(sq)) * 8 + chess.square_file(sq)]
-                 for sq in chess.SQUARES)
-    for piece, rows in _PST_WHITE_SOURCE.items()
-}
-PST_B: dict[chess.PieceType, tuple[int, ...]] = {
-    piece: tuple(table[chess.square_mirror(sq)] for sq in chess.SQUARES)
-    for piece, table in PST_W.items()
-}
-
-ROOK_OPEN_FILE = 25       # no pawns of either colour on the file
-ROOK_SEMI_OPEN = 12       # none of our own pawns
-ROOK_ON_SEVENTH = 20      # cuts off the king and hits the pawn base
-PST_WEIGHT = 1.5           # tables are in centipawns; scale to sit beside the other terms
-
-
-def placement(board: chess.Board, color: chess.Color) -> float:
-    """Piece-square tables plus rook placement, in one pass over the bitboards.
-
-    Deliberately avoids board.piece_map(), which builds a dict of Piece objects and
-    cost 30us per call. Scanning the per-piece bitboards directly and indexing a
-    pre-mirrored table is roughly an order of magnitude cheaper.
-    """
-    total = 0
-    all_pawns = board.pawns
-    for piece_type in PIECE_ORDER:
-        mine_table = PST_W[piece_type] if color == chess.WHITE else PST_B[piece_type]
-        their_table = PST_B[piece_type] if color == chess.WHITE else PST_W[piece_type]
-        for square in chess.scan_forward(board.pieces_mask(piece_type, color)):
-            total += mine_table[square]
-        for square in chess.scan_forward(board.pieces_mask(piece_type, not color)):
-            total -= their_table[square]
-
-    for side, sign in ((color, 1), (not color, -1)):
-        own_pawns = board.pawns & board.occupied_co[side]
-        seventh = 6 if side == chess.WHITE else 1
-        for square in chess.scan_forward(board.pieces_mask(chess.ROOK, side)):
-            file_mask = chess.BB_FILES[chess.square_file(square)]
-            if not all_pawns & file_mask:
-                total += sign * ROOK_OPEN_FILE
-            elif not own_pawns & file_mask:
-                total += sign * ROOK_SEMI_OPEN
-            if chess.square_rank(square) == seventh:
-                total += sign * ROOK_ON_SEVENTH
-    return PST_WEIGHT * total
-
-
-# ---------------------------------------------------------------------------
-# JIT-compiled evaluation kernel.
-#
-# placement() and material() are pure bitboard arithmetic, and together they were
-# 8.7us of a 21.4us evaluation. numba compiles them to machine code: 1.5us, and
-# the compile costs 0.43s of the 60s import budget. Nothing native ships - numba
-# compiles from this source on the platform, which is what the rules require.
-#
-# If numba is unavailable for any reason the Python versions below still work and
-# the agent simply runs slower, so an import failure can never cost a game.
-# ---------------------------------------------------------------------------
-
-try:
-    from numba import njit
-
-    NUMBA = True
-except ImportError:                                          # pragma: no cover
-    NUMBA = False
-
-_PST_W_FLAT = np.zeros(6 * 64, dtype=np.int32)
-_PST_B_FLAT = np.zeros(6 * 64, dtype=np.int32)
-for _i, _pt in enumerate(PIECE_ORDER):
-    for _sq in range(64):
-        _PST_W_FLAT[_i * 64 + _sq] = PST_W[_pt][_sq]
-        _PST_B_FLAT[_i * 64 + _sq] = PST_B[_pt][_sq]
-
-_VALUES = np.array([int(PIECE_VALUE.get(p, 0)) for p in PIECE_ORDER], dtype=np.int32)
-_FILES = np.array([int(chess.BB_FILES[f]) for f in range(8)], dtype=np.uint64)
-_BOARDS = np.zeros(6, dtype=np.uint64)          # reused, so packing allocates nothing
-
-
-def _kernel(
-    boards: Any, occ_us: Any, occ_them: Any, pst_us: Any, pst_them: Any,
-    values: Any, files: Any, us_white: bool,
-    open_bonus: int, semi_bonus: int, seventh_bonus: int,
-) -> tuple[int, int]:
-    """Piece-square tables, material and rook placement in one sweep."""
-    pst = 0
-    material = 0
-    all_pawns = boards[0]
-    for i in range(6):
-        bb = boards[i] & occ_us
-        while bb:
-            sq = int(np.log2(np.float64(bb & (~bb + np.uint64(1)))))
-            pst += pst_us[i * 64 + sq]
-            material += values[i]
-            if i == 3:                                        # rook
-                fmask = files[sq & 7]
-                own_pawns = all_pawns & occ_us
-                if not (all_pawns & fmask):
-                    pst += open_bonus
-                elif not (own_pawns & fmask):
-                    pst += semi_bonus
-                if (sq >> 3) == (6 if us_white else 1):
-                    pst += seventh_bonus
-            bb &= bb - np.uint64(1)
-        bb = boards[i] & occ_them
-        while bb:
-            sq = int(np.log2(np.float64(bb & (~bb + np.uint64(1)))))
-            pst -= pst_them[i * 64 + sq]
-            material -= values[i]
-            if i == 3:
-                fmask = files[sq & 7]
-                their_pawns = all_pawns & occ_them
-                if not (all_pawns & fmask):
-                    pst -= open_bonus
-                elif not (their_pawns & fmask):
-                    pst -= semi_bonus
-                if (sq >> 3) == (1 if us_white else 6):
-                    pst -= seventh_bonus
-            bb &= bb - np.uint64(1)
-    return pst, material
-
-
-if NUMBA:
-    _kernel = njit(cache=False)(_kernel)
-
-
-def placement_and_material(board: chess.Board, color: chess.Color) -> tuple[float, float]:
-    """Returns (placement, material), both already weighted."""
-    _BOARDS[0] = board.pawns
-    _BOARDS[1] = board.knights
-    _BOARDS[2] = board.bishops
-    _BOARDS[3] = board.rooks
-    _BOARDS[4] = board.queens
-    _BOARDS[5] = board.kings
-    white = color == chess.WHITE
-    pst, material = _kernel(
-        _BOARDS,
-        np.uint64(board.occupied_co[color]),
-        np.uint64(board.occupied_co[not color]),
-        _PST_W_FLAT if white else _PST_B_FLAT,
-        _PST_B_FLAT if white else _PST_W_FLAT,
-        _VALUES, _FILES, white,
-        ROOK_OPEN_FILE, ROOK_SEMI_OPEN, ROOK_ON_SEVENTH,
-    )
-    return PST_WEIGHT * pst, MATERIAL_WEIGHT * material
-
-
 def evaluate_board(board: chess.Board, mover: chess.Color) -> float:
+    # with open("Log.txt","a") as f:
+    #     if mover:
+    #         f.writelines(f"""
+    #     UNDERDEVELOPED: {underdevloped(board,mover)}
+    #     CENTRE_FIGHT: {fighting_for_central_squares(board,mover)}
+    #     FIANCHETTO: {fianchetto(board,mover)}
+    #     MATERIAL: {material(board, mover)}
+    #     CENTRE_PAWN: {central_pawn_chain(board,mover)}
+    #     CENTRE_SUPPORTS: {support_centre(board,mover)}
+    #     KING_SAFETY: {king_safety(board,mover)}
+    #     DIM_KNIGHT: {dim_knight(board,mover)}
+    #     KING_AWAY_CENTRE: {king_away_from_centre(board,mover)}
+    #     LEGAL_CAPTURES: {score_legal_captures(board)}
+    #     # ACTIVITY: {increases_activity(before,board)}
+    #     MOBILE:  {(0.25 * mobility)}\n"""
+    # )
+
+    #     f.close()
+
+   
+    
     check_fee = 0.0
     if board.is_check():
-        check_fee += 25.0
+        check_fee+=25.0
 
-    # Piece-square tables, material and rook placement come back from one JIT'd
-    # sweep over the bitboards - they were 8.7us of a 21.4us eval in pure Python.
-    place, mat = placement_and_material(board, mover)
+   
 
     return (
-        place
-        + mat
-        + check_fee
-        + underdevloped(board, mover)
-        + fighting_for_central_squares(board, mover)
-        + support_centre(board, mover)
-        + dim_knight(board, mover)
-        + king_away_from_centre(board, mover)
-        + passed_pawns_score(board, mover)
-        + king_shelter(board, mover)
-    )
+    underdevloped(board,mover)+
+    fighting_for_central_squares(board,mover)+
+    # fianchetto(board,mover)+
+    material(board, mover)+
+    # central_pawn_chain(board,mover)+
+    support_centre(board,mover)+
+    # king_safety(board,mover)+
+    dim_knight(board,mover)+
+    king_away_from_centre(board,mover)+
+    # king_attack(board,mover)+   # 5.9us/leaf and KING_ATTACK_BONUS is 0 -> always 0.
+    #                               Measured worse in games at 5 and 15 (98.3% at 0).
+    #                               Uncomment together with a non-zero bonus.
+    check_fee+
+    passed_pawns_score(board,mover)+
+    king_shelter(board,mover)
+    # score_legal_captures(board)+
+    # increases_activity(before,board)+
+   
+   )
 
    
 MAX_PLY = 24            # absolute ceiling across negamax AND quiesce combined
@@ -933,75 +782,3 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
 # def fianchetto(board: chess.Board, color: chess.Color) -> int:
 #     return FIANCHETTO_BONUS * (fianchettoed(board, color) - fianchettoed(board, not color))
-
-
-# ===========================================================================
-# UNUSED. Kept for reference and because several were measured, not guessed.
-# Nothing below is called: evaluate_board does not reference them and neither
-# does the search. Commented out so they cost nothing at import and cannot be
-# revived by accident.
-# ===========================================================================
-#
-# --- king_zone_pressure: only used by king_attack. Counts attackers without weighting by piece
-# def king_zone_pressure(board: chess.Board, color: chess.Color) -> int:
-#     """Count how many times color attacks the squares around the enemy king."""
-#     enemy_king = board.king(not color)
-#     if enemy_king is None:
-#         return 0
-#     return sum(
-#         chess.popcount(board.attackers_mask(color, square))
-#         for square in board.attacks(enemy_king)
-#     )
-#
-# --- king_attack: measured WORSE in games: 98.3% at bonus 0 vs 90.0% at 5 and 90.8% at 15.
-# def king_attack(board: chess.Board, color: chess.Color) -> int:
-#     return KING_ATTACK_BONUS * (
-#         king_zone_pressure(board, color) - king_zone_pressure(board, not color)
-#     )  
-#
-#
-# --- bishop_pair: never wired into evaluate_board.
-# def bishop_pair(board: chess.Board, color: chess.Color) -> int:
-#     mine = len(board.pieces(chess.BISHOP, color)) >= 2
-#     theirs = len(board.pieces(chess.BISHOP, not color)) >= 2
-#     return BISHOP_PAIR_BONUS * (mine - theirs)
-#
-# --- hanging_pieces: a stub that returns None.
-# def hanging_pieces(board: chess.Board, color: chess.Color) -> None:
-#     pass
-#
-# --- real_defenders: 1.2% wrong: is_pinned is evaluated before the capture, and pins change aft
-# def real_defenders(board: chess.Board, color: chess.Color, square: chess.Square) -> int:
-#     return sum(1 for sq in board.attackers(color, square)
-#                if not board.is_pinned(color, sq))
-#
-# --- score_legal_captures: superseded by quiescence, which plays captures out instead of guessing.
-# def score_legal_captures(board: chess.Board) -> float:
-#
-#
-#     valuable_captures = 0.0
-#     for m in board.generate_legal_captures():
-#
-#         attacker = board.piece_type_at(m.from_square) or chess.PAWN
-#         victim = chess.PAWN if board.is_en_passant(m) else (
-#             board.piece_type_at(m.to_square) or chess.PAWN
-#         )
-#         attacker_value = PIECE_VALUE[attacker]
-#         victim_value = PIECE_VALUE[victim]
-#
-#         opponent_defenders =  real_defenders(board,not board.turn,m.to_square)
-#
-#         if attacker_value > victim_value and opponent_defenders > 0:
-#             valuable_captures -=  0.1*(attacker_value - victim_value)
-#
-#         elif attacker_value <victim_value:
-#                     valuable_captures +=  0.1*(victim_value-attacker_value)
-#
-#         elif opponent_defenders < real_defenders(board,board.turn,m.to_square)-1:
-#             valuable_captures += 2
-#
-#         else:
-#             valuable_captures += 1
-#
-#     return valuable_captures
-#

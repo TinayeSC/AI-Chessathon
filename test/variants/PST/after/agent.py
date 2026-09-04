@@ -4,14 +4,13 @@
 import math
 import time
 from pathlib import Path
-from typing import Any
 
 import chess
 import chess.polyglot
 import numpy as np
 
 # DEPTH = 2
-BOOK_PATH = Path(__file__).parent / "weights" / "elite.bin"
+BOOK_PATH = Path(__file__).resolve().parents[4] / "weights" / "elite.bin"
 BOOK = chess.polyglot.open_reader(BOOK_PATH) if BOOK_PATH.exists() else None
 
 ### TRY WORKING ON DYNAMIC PIECE VALUE. PIECE VALUE STARTS AT STANDARD VALUES, BUT AS THE GAME
@@ -129,7 +128,7 @@ MATE = 10**6
 CP_SCALE = 400.0
 PIECE_ORDER = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
 
-_w = np.load(Path(__file__).parent / "weights" / "eval_net.npz")
+_w = np.load(Path(__file__).resolve().parents[4] / "weights" / "eval_net.npz")
 W0, b0, W1, b1, W2, b2 = _w["W0"], _w["b0"], _w["W1"], _w["b1"], _w["W2"], _w["b2"]
 # Read the training scale from the file itself. Keeping it as a separate constant
 # here means a retrain at a different scale silently mis-scales every evaluation.
@@ -248,14 +247,11 @@ def leaf_eval(board: chess.Board, mover: chess.Color) -> float:
     return NET_WEIGHT * net + (1.0 - NET_WEIGHT) * hand
 
 
-MATERIAL_WEIGHT = 5.0     # one constant, so the JIT kernel and this cannot drift apart
-
-
 def material(board: chess.Board, side: chess.Color) -> float:
     return sum(
         value * (len(board.pieces(piece, side)) - len(board.pieces(piece, not side)))
         for piece, value in PIECE_VALUE.items()
-    ) * MATERIAL_WEIGHT
+    )*5.0
 
 
 # THIS IS EXPENSIVE ITERATING OVER 8 PAWNS. WE ONLY REALLY CARE ABOUT THE TWO
@@ -488,7 +484,7 @@ PST_B: dict[chess.PieceType, tuple[int, ...]] = {
 ROOK_OPEN_FILE = 25       # no pawns of either colour on the file
 ROOK_SEMI_OPEN = 12       # none of our own pawns
 ROOK_ON_SEVENTH = 20      # cuts off the king and hits the pawn base
-PST_WEIGHT = 1.5           # tables are in centipawns; scale to sit beside the other terms
+PST_WEIGHT = 0.35         # tables are in centipawns; scale to sit beside the other terms
 
 
 def placement(board: chess.Board, color: chess.Color) -> float:
@@ -522,126 +518,55 @@ def placement(board: chess.Board, color: chess.Color) -> float:
     return PST_WEIGHT * total
 
 
-# ---------------------------------------------------------------------------
-# JIT-compiled evaluation kernel.
-#
-# placement() and material() are pure bitboard arithmetic, and together they were
-# 8.7us of a 21.4us evaluation. numba compiles them to machine code: 1.5us, and
-# the compile costs 0.43s of the 60s import budget. Nothing native ships - numba
-# compiles from this source on the platform, which is what the rules require.
-#
-# If numba is unavailable for any reason the Python versions below still work and
-# the agent simply runs slower, so an import failure can never cost a game.
-# ---------------------------------------------------------------------------
-
-try:
-    from numba import njit
-
-    NUMBA = True
-except ImportError:                                          # pragma: no cover
-    NUMBA = False
-
-_PST_W_FLAT = np.zeros(6 * 64, dtype=np.int32)
-_PST_B_FLAT = np.zeros(6 * 64, dtype=np.int32)
-for _i, _pt in enumerate(PIECE_ORDER):
-    for _sq in range(64):
-        _PST_W_FLAT[_i * 64 + _sq] = PST_W[_pt][_sq]
-        _PST_B_FLAT[_i * 64 + _sq] = PST_B[_pt][_sq]
-
-_VALUES = np.array([int(PIECE_VALUE.get(p, 0)) for p in PIECE_ORDER], dtype=np.int32)
-_FILES = np.array([int(chess.BB_FILES[f]) for f in range(8)], dtype=np.uint64)
-_BOARDS = np.zeros(6, dtype=np.uint64)          # reused, so packing allocates nothing
-
-
-def _kernel(
-    boards: Any, occ_us: Any, occ_them: Any, pst_us: Any, pst_them: Any,
-    values: Any, files: Any, us_white: bool,
-    open_bonus: int, semi_bonus: int, seventh_bonus: int,
-) -> tuple[int, int]:
-    """Piece-square tables, material and rook placement in one sweep."""
-    pst = 0
-    material = 0
-    all_pawns = boards[0]
-    for i in range(6):
-        bb = boards[i] & occ_us
-        while bb:
-            sq = int(np.log2(np.float64(bb & (~bb + np.uint64(1)))))
-            pst += pst_us[i * 64 + sq]
-            material += values[i]
-            if i == 3:                                        # rook
-                fmask = files[sq & 7]
-                own_pawns = all_pawns & occ_us
-                if not (all_pawns & fmask):
-                    pst += open_bonus
-                elif not (own_pawns & fmask):
-                    pst += semi_bonus
-                if (sq >> 3) == (6 if us_white else 1):
-                    pst += seventh_bonus
-            bb &= bb - np.uint64(1)
-        bb = boards[i] & occ_them
-        while bb:
-            sq = int(np.log2(np.float64(bb & (~bb + np.uint64(1)))))
-            pst -= pst_them[i * 64 + sq]
-            material -= values[i]
-            if i == 3:
-                fmask = files[sq & 7]
-                their_pawns = all_pawns & occ_them
-                if not (all_pawns & fmask):
-                    pst -= open_bonus
-                elif not (their_pawns & fmask):
-                    pst -= semi_bonus
-                if (sq >> 3) == (1 if us_white else 6):
-                    pst -= seventh_bonus
-            bb &= bb - np.uint64(1)
-    return pst, material
-
-
-if NUMBA:
-    _kernel = njit(cache=False)(_kernel)
-
-
-def placement_and_material(board: chess.Board, color: chess.Color) -> tuple[float, float]:
-    """Returns (placement, material), both already weighted."""
-    _BOARDS[0] = board.pawns
-    _BOARDS[1] = board.knights
-    _BOARDS[2] = board.bishops
-    _BOARDS[3] = board.rooks
-    _BOARDS[4] = board.queens
-    _BOARDS[5] = board.kings
-    white = color == chess.WHITE
-    pst, material = _kernel(
-        _BOARDS,
-        np.uint64(board.occupied_co[color]),
-        np.uint64(board.occupied_co[not color]),
-        _PST_W_FLAT if white else _PST_B_FLAT,
-        _PST_B_FLAT if white else _PST_W_FLAT,
-        _VALUES, _FILES, white,
-        ROOK_OPEN_FILE, ROOK_SEMI_OPEN, ROOK_ON_SEVENTH,
-    )
-    return PST_WEIGHT * pst, MATERIAL_WEIGHT * material
-
-
 def evaluate_board(board: chess.Board, mover: chess.Color) -> float:
+    # with open("Log.txt","a") as f:
+    #     if mover:
+    #         f.writelines(f"""
+    #     UNDERDEVELOPED: {underdevloped(board,mover)}
+    #     CENTRE_FIGHT: {fighting_for_central_squares(board,mover)}
+    #     FIANCHETTO: {fianchetto(board,mover)}
+    #     MATERIAL: {material(board, mover)}
+    #     CENTRE_PAWN: {central_pawn_chain(board,mover)}
+    #     CENTRE_SUPPORTS: {support_centre(board,mover)}
+    #     KING_SAFETY: {king_safety(board,mover)}
+    #     DIM_KNIGHT: {dim_knight(board,mover)}
+    #     KING_AWAY_CENTRE: {king_away_from_centre(board,mover)}
+    #     LEGAL_CAPTURES: {score_legal_captures(board)}
+    #     # ACTIVITY: {increases_activity(before,board)}
+    #     MOBILE:  {(0.25 * mobility)}\n"""
+    # )
+
+    #     f.close()
+
+   
+    
     check_fee = 0.0
     if board.is_check():
-        check_fee += 25.0
+        check_fee+=25.0
 
-    # Piece-square tables, material and rook placement come back from one JIT'd
-    # sweep over the bitboards - they were 8.7us of a 21.4us eval in pure Python.
-    place, mat = placement_and_material(board, mover)
+   
 
     return (
-        place
-        + mat
-        + check_fee
-        + underdevloped(board, mover)
-        + fighting_for_central_squares(board, mover)
-        + support_centre(board, mover)
-        + dim_knight(board, mover)
-        + king_away_from_centre(board, mover)
-        + passed_pawns_score(board, mover)
-        + king_shelter(board, mover)
-    )
+    underdevloped(board,mover)+
+    fighting_for_central_squares(board,mover)+
+    # fianchetto(board,mover)+
+    material(board, mover)+
+    # central_pawn_chain(board,mover)+
+    support_centre(board,mover)+
+    # king_safety(board,mover)+
+    dim_knight(board,mover)+
+    king_away_from_centre(board,mover)+
+    # king_attack(board,mover)+   # 5.9us/leaf and KING_ATTACK_BONUS is 0 -> always 0.
+    #                               Measured worse in games at 5 and 15 (98.3% at 0).
+    #                               Uncomment together with a non-zero bonus.
+    check_fee+
+    passed_pawns_score(board,mover)+
+    placement(board,mover)+
+    king_shelter(board,mover)
+    # score_legal_captures(board)+
+    # increases_activity(before,board)+
+   
+   )
 
    
 MAX_PLY = 24            # absolute ceiling across negamax AND quiesce combined

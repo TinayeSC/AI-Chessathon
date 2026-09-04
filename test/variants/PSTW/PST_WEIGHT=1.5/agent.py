@@ -11,7 +11,7 @@ import chess.polyglot
 import numpy as np
 
 # DEPTH = 2
-BOOK_PATH = Path(__file__).parent / "weights" / "elite.bin"
+BOOK_PATH = Path(__file__).resolve().parents[4] / "weights" / "elite.bin"
 BOOK = chess.polyglot.open_reader(BOOK_PATH) if BOOK_PATH.exists() else None
 
 ### TRY WORKING ON DYNAMIC PIECE VALUE. PIECE VALUE STARTS AT STANDARD VALUES, BUT AS THE GAME
@@ -129,7 +129,7 @@ MATE = 10**6
 CP_SCALE = 400.0
 PIECE_ORDER = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
 
-_w = np.load(Path(__file__).parent / "weights" / "eval_net.npz")
+_w = np.load(Path(__file__).resolve().parents[4] / "weights" / "eval_net.npz")
 W0, b0, W1, b1, W2, b2 = _w["W0"], _w["b0"], _w["W1"], _w["b1"], _w["W2"], _w["b2"]
 # Read the training scale from the file itself. Keeping it as a separate constant
 # here means a retrain at a different scale silently mis-scales every evaluation.
@@ -488,7 +488,7 @@ PST_B: dict[chess.PieceType, tuple[int, ...]] = {
 ROOK_OPEN_FILE = 25       # no pawns of either colour on the file
 ROOK_SEMI_OPEN = 12       # none of our own pawns
 ROOK_ON_SEVENTH = 20      # cuts off the king and hits the pawn base
-PST_WEIGHT = 1.5           # tables are in centipawns; scale to sit beside the other terms
+PST_WEIGHT = 1.5         # tables are in centipawns; scale to sit beside the other terms
 
 
 def placement(board: chess.Board, color: chess.Color) -> float:

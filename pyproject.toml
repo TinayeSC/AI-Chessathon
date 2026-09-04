@@ -10,6 +10,7 @@ package = false
 [dependency-groups]
 dev = [
     "mypy>=1.18",
+    "numba>=0.67.0",
     "numpy>=2.5.2",
     "ruff>=0.14",
     "torch>=2.14.0",
